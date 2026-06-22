@@ -1,8 +1,15 @@
 /* ───────────────────────────────────────────────────────────────
-   GM service-hover cubes — UX + Motion faces (section-5)
-   Reuses the live hosted cube engine's globals (THREE / gmDV / gmUW),
-   parametrised by face image. Builds on real card hover only; bounds
-   live WebGL contexts to one card's worth at a time.
+   GM service-hover cubes — UX + Motion faces (section-5)   v1.1.0
+   Reuses the live cube engine globals (THREE / gmDV / gmUW).
+   v1.1 changes:
+     • Trigger moved to DOCUMENT-LEVEL DELEGATION (capture phase) —
+       immune to gmsvchover re-processing/cloning the card nodes,
+       which was stripping the per-card listeners in v1.0.
+     • IntersectionObserver on the services section disposes all cube
+       loops when it scrolls out of view, so no WebGL rAF runs during
+       scroll (protects the snap engine + perf). Rebuilds on next hover.
+     • Mouse-look gated by pointer-inside-tile (matches brand: only the
+       hovered cube leans), with no node listeners to lose.
    Depends on: window.THREE (r128), window.gmDV, window.gmUW
    ─────────────────────────────────────────────────────────────── */
 (function () {
@@ -13,12 +20,22 @@
     'ux-cube':     'https://cdn.prod.website-files.com/6166559d0e98ddef18bde8c3/6a38091f4e7e069355cfcda0_cube-face-uxui.png',
     'motion-cube': 'https://cdn.prod.website-files.com/6166559d0e98ddef18bde8c3/6a38091f83e3f7b26ef8a4b3_cube-face-motion.png'
   };
+  var KEYS = ['ux-cube', 'motion-cube'];
   /* ================================================================ */
 
   if (window.__gmSvcCubesInit) return;
   window.__gmSvcCubesInit = true;
 
-  var faceCache = {};   // src -> {top,left,right} baked canvases (context-independent)
+  var faceCache = {};
+  var groups = {};
+  var active = null;
+  var leaveTimer = 0;
+
+  function ready() {
+    return typeof window.THREE !== 'undefined' &&
+           typeof window.gmDV === 'function' &&
+           typeof window.gmUW === 'function';
+  }
 
   function flatTex(hex) {
     var c = document.createElement('canvas'); c.width = c.height = 4;
@@ -35,7 +52,6 @@
     };
   }
 
-  // Build one cube into `wrap` using face image `src`. Returns a handle.
   function buildCube(wrap, src) {
     var S = Math.min(wrap.offsetWidth, wrap.offsetHeight) || 160;
     var DPR = Math.min(window.devicePixelRatio || 1, 1.5);
@@ -62,7 +78,6 @@
     ]));
     sc.add(grp);
 
-    // soft contact shadow (matches engine footprint)
     (function () {
       var SZ = 256, c = document.createElement('canvas'); c.width = c.height = SZ;
       var x = c.getContext('2d');
@@ -89,18 +104,14 @@
       img.src = src;
     }
 
-    // input — identical to engine: per-tile cachedRect, only the hovered
-    // cube leans toward the cursor; eases to neutral on leave.
-    var mx = { x: 0, y: 0 }, tg = { x: 0, y: 0 }, wT = 0, bT = 0, cachedRect = null, rectTimer = 0;
-    function onEnter() { rectTimer = setTimeout(function () { cachedRect = wrap.getBoundingClientRect(); }, 350); }
-    function onLeave() { clearTimeout(rectTimer); cachedRect = null; mx.x = 0; mx.y = 0; tg.x = 0; tg.y = 0; }
+    var mx = { x: 0, y: 0 }, tg = { x: 0, y: 0 }, wT = 0, bT = 0;
     function onMove(e) {
-      if (!cachedRect) return;
-      mx.x = ((e.clientX - cachedRect.left) / cachedRect.width  - 0.5) * 2;
-      mx.y = ((e.clientY - cachedRect.top)  / cachedRect.height - 0.5) * 2;
+      var R = cv.getBoundingClientRect();
+      if (e.clientX >= R.left && e.clientX <= R.right && e.clientY >= R.top && e.clientY <= R.bottom) {
+        mx.x = ((e.clientX - R.left) / R.width  - 0.5) * 2;
+        mx.y = ((e.clientY - R.top)  / R.height - 0.5) * 2;
+      } else { mx.x = 0; mx.y = 0; }
     }
-    wrap.addEventListener('mouseenter', onEnter);
-    wrap.addEventListener('mouseleave', onLeave);
     document.addEventListener('mousemove', onMove);
     function lerp(a, b, t) { return a + (b - a) * t; }
 
@@ -119,9 +130,6 @@
     function pause()  { running = false; if (raf) cancelAnimationFrame(raf); r.render(sc, cam); }
     function dispose() {
       running = false; if (raf) cancelAnimationFrame(raf);
-      clearTimeout(rectTimer);
-      wrap.removeEventListener('mouseenter', onEnter);
-      wrap.removeEventListener('mouseleave', onLeave);
       document.removeEventListener('mousemove', onMove);
       try { r.dispose(); r.forceContextLoss && r.forceContextLoss(); } catch (e) {}
       if (cv.parentNode) cv.parentNode.removeChild(cv);
@@ -130,65 +138,89 @@
     return { dispose: dispose, pause: pause, resume: resume };
   }
 
-  // ── wiring: one cube per .ux-cube / .motion-cube tile, on card hover ──
-  var groups = {};   // key -> { card, tiles:[handle], built:bool }
+  function tilesFor(key) { return [].slice.call(document.querySelectorAll('.cube-image-container.' + key)); }
 
-  function buildGroup(key) {
+  function build(key) {
+    if (!ready()) return;
     var g = groups[key];
-    if (!g || g.built) return;
-    g.built = true;
-    g.handles = [].map.call(g.card.querySelectorAll('.' + key), function (tile) {
-      // guard: never double-build a tile
-      if (tile.__gmCube) return tile.__gmCube;
-      var h = buildCube(tile, FACES[key]);
-      tile.__gmCube = h;
+    if (g && g.built) return;
+    var tiles = tilesFor(key);
+    if (!tiles.length) return;
+    groups[key] = { built: true, handles: tiles.map(function (t) {
+      if (t.__gmCube) return t.__gmCube;
+      var h = buildCube(t, FACES[key]);
+      t.__gmCube = h;
       return h;
-    });
+    }) };
   }
-  function disposeGroup(key) {
+  function dispose(key) {
     var g = groups[key]; if (!g || !g.built) return;
     (g.handles || []).forEach(function (h) { try { h.dispose(); } catch (e) {} });
-    [].forEach.call(g.card.querySelectorAll('.' + key), function (t) { t.__gmCube = null; });
-    g.built = false; g.handles = null;
+    tilesFor(key).forEach(function (t) { t.__gmCube = null; });
+    groups[key] = { built: false, handles: null };
+    if (active === key) active = null;
   }
-  function pauseGroup(key)  { var g = groups[key]; if (g && g.built) (g.handles||[]).forEach(function(h){h.pause();}); }
-  function resumeGroup(key) { var g = groups[key]; if (g && g.built) (g.handles||[]).forEach(function(h){h.resume();}); }
+  function pause(key)  { var g = groups[key]; if (g && g.built) (g.handles || []).forEach(function (h) { h.pause(); }); }
+  function resume(key) { var g = groups[key]; if (g && g.built) (g.handles || []).forEach(function (h) { h.resume(); }); }
 
-  function findCard(key) {
-    var tile = document.querySelector('.cube-image-container.' + key);
-    return tile ? tile.closest('.service-container') : null;
+  function activate(key) {
+    clearTimeout(leaveTimer);
+    KEYS.forEach(function (k) { if (k !== key) dispose(k); });
+    build(key);
+    resume(key);
+    active = key;
+  }
+  function deactivate() {
+    if (!active) return;
+    var k = active;
+    pause(k);
+    clearTimeout(leaveTimer);
+    leaveTimer = setTimeout(function () { dispose(k); }, 800);
   }
 
-  function init() {
-    if (typeof window.THREE === 'undefined' || typeof window.gmDV !== 'function' || typeof window.gmUW !== 'function') {
-      return requestAnimationFrame(init);
+  function keyForEvent(e) {
+    var el = e.target;
+    if (!el || !el.closest) return null;
+    var card = el.closest('.service-container');
+    if (!card) return null;
+    if (card.querySelector('.cube-image-container.ux-cube')) return 'ux-cube';
+    if (card.querySelector('.cube-image-container.motion-cube')) return 'motion-cube';
+    return '__other__';
+  }
+
+  document.addEventListener('mouseover', function (e) {
+    var key = keyForEvent(e);
+    if (key === 'ux-cube' || key === 'motion-cube') activate(key);
+    else if (key === '__other__') deactivate();
+  }, true);
+
+  document.addEventListener('mouseout', function (e) {
+    if (!active) return;
+    var to = e.relatedTarget;
+    var stillInActive = to && to.closest && (function () {
+      var c = to.closest('.service-container');
+      return c && c.querySelector('.cube-image-container.' + active);
+    })();
+    if (!stillInActive) deactivate();
+  }, true);
+
+  function watchSection() {
+    var sec = document.getElementById('section-5');
+    if (!sec) {
+      var t = document.querySelector('.cube-image-container.ux-cube');
+      sec = t ? t.closest('section') : null;
     }
-    ['ux-cube', 'motion-cube'].forEach(function (key) {
-      var card = findCard(key);
-      if (!card || groups[key]) return;
-      groups[key] = { card: card, built: false, handles: null };
-      var leaveTimer = 0;
-
-      card.addEventListener('mouseenter', function () {
-        clearTimeout(leaveTimer);
-        // bound contexts: dispose the *other* group when this one activates
-        var other = key === 'ux-cube' ? 'motion-cube' : 'ux-cube';
-        disposeGroup(other);
-        buildGroup(key);
-        resumeGroup(key);
+    if (!sec || !('IntersectionObserver' in window)) return;
+    new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (!en.isIntersecting) { active = null; KEYS.forEach(dispose); }
       });
-      card.addEventListener('mouseleave', function () {
-        clearTimeout(leaveTimer);
-        // pause immediately (idle, keep context); dispose shortly after to free GPU
-        pauseGroup(key);
-        leaveTimer = setTimeout(function () { disposeGroup(key); }, 800);
-      });
-    });
+    }, { threshold: 0 }).observe(sec);
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', watchSection);
   } else {
-    init();
+    watchSection();
   }
 })();
